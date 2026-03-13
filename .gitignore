@@ -1,0 +1,5 @@
+*.json
+*.tmp
+pycache/
+*.pyc
+.DS_Store
