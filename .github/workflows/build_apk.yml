@@ -8,66 +8,22 @@ on:
 jobs:
   build:
     runs-on: ubuntu-22.04
-    timeout-minutes: 60
+    timeout-minutes: 90
 
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
+      - name: Buildozer Action
+        uses: ArtemSBulgakov/buildozer-action@v1
+        id: buildozer
         with:
-          python-version: "3.10"
-
-      - uses: actions/setup-java@v4
-        with:
-          java-version: "17"
-          distribution: temurin
-
-      - name: Sistem bagimliliklar
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y git zip unzip autoconf libtool \
-            pkg-config zlib1g-dev libncurses5-dev cmake \
-            libffi-dev libssl-dev
-
-      - name: pip kurulum
-        run: pip install buildozer cython==0.29.37
-
-      - name: NDK ve SDK symlink (indirme atlat)
-        run: |
-          mkdir -p ~/.buildozer/android/platform
-          # NDK r27c olarak simge bagla
-          ln -sf /usr/local/lib/android/sdk/ndk/27.3.13750724 \
-            ~/.buildozer/android/platform/android-ndk-r27c
-          # SDK bagla
-          ln -sf /usr/local/lib/android/sdk \
-            ~/.buildozer/android/platform/android-sdk
-          echo "NDK: $(ls ~/.buildozer/android/platform/android-ndk-r27c | head -3)"
-
-      - name: Cache
-        uses: actions/cache@v4
-        with:
-          path: .buildozer
-          key: buildozer-${{ hashFiles('buildozer.spec') }}
-
-      - name: APK derle
-        run: buildozer -v android debug 2>&1
-
-      - name: APK bul
-        id: apk
-        run: |
-          APK=$(find . -name "*.apk" 2>/dev/null | head -1)
-          echo "APK: $APK"
-          if [ -z "$APK" ]; then
-            echo "APK bulunamadi - bin/ icerigi:"
-            ls -la bin/ 2>/dev/null || echo "bin/ yok"
-            exit 1
-          fi
-          echo "apk_path=$APK" >> $GITHUB_OUTPUT
+          command: android debug
+          buildozer_version: stable
 
       - name: Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: v8.0-build-${{ github.run_number }}
           name: "Trade Sinyal Ultra v8.0 — Build #${{ github.run_number }}"
-          files: ${{ steps.apk.outputs.apk_path }}
+          files: ${{ steps.buildozer.outputs.filename }}
           token: ${{ secrets.GITHUB_TOKEN }}
