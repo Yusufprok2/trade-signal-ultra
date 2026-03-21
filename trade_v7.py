@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 ╔══════════════════════════════════════════════════════════════════════════╗
-║   TRADE SİNYAL SİSTEMİ  ULTRA  v7.0  —  Termux Edition                ║
+║   TRADE SİNYAL SİSTEMİ  ULTRA  v8.0  —  Termux Edition                ║
 ║                                                                          ║
 ║   v7 YENİLİKLER (2024-2025 araştırma bazlı):                           ║
 ║   ├─ Makro Veri      : USD/TRY, Altın, Brent, BIST100 korelasyonu      ║
@@ -1128,6 +1128,497 @@ def kural_sinyal(df, sembol=""):
 #  KATMAN 7: BİRLEŞİK KARAR
 # ════════════════════════════════════════════════════════════════════════
 
+
+# ════════════════════════════════════════════════════════════════════════
+#  KATMAN v8-A: KELLY CRITERION — Optimal Pozisyon Büyüklüğü
+# ════════════════════════════════════════════════════════════════════════
+
+def kelly_criterion(ml, backtest_sonuc=None):
+    """
+    Kelly Formülü: f* = (b×p - q) / b
+      b = ort_kazanç / ort_kayıp oranı (R/R)
+      p = kazanma olasılığı (ML win rate veya backtest win rate)
+      q = 1 - p
+
+    Araştırma: Kelly ile optimize edilmiş pozisyon büyüklüğü
+    uzun vadede geometrik ortalama büyümeyi maksimize eder.
+    Tam Kelly çok agresif olduğu için yarı-Kelly (f/2) kullanılır.
+
+    Döndürür: {
+        "kelly_f": optimal fraksiyon (0-1),
+        "yari_kelly": f/2 (daha güvenli),
+        "yoo_pct": portföyün yüzdesi,
+        "win_rate": kullanılan win rate,
+        "rr_oran": R/R oranı,
+        "aciklama": metin,
+    }
+    """
+    # Win rate kaynağı: önce backtest, yoksa ML proba
+    win_rate = 0.5
+    rr_oran  = 2.0  # default R/R = 2
+
+    if backtest_sonuc and backtest_sonuc.get("n_islem", 0) >= 10:
+        win_rate = backtest_sonuc["winrate"] / 100.0
+        if backtest_sonuc.get("ort_kazan", 0) and backtest_sonuc.get("ort_kayip", 0):
+            rr_oran = abs(backtest_sonuc["ort_kazan"]) / max(abs(backtest_sonuc["ort_kayip"]), 0.01)
+    elif ml and ml.get("wf_acc", 0) > 0:
+        win_rate = ml["wf_acc"]
+        # R/R tahmini: ML proba'dan AL ve SAT olasılıklarına bak
+        proba = ml.get("proba", {})
+        p_al  = proba.get(1, 0); p_sat = proba.get(-1, 0)
+        if p_al > 0 and p_sat > 0:
+            rr_oran = (p_al / max(p_sat, 0.01)) * ATR_TP / ATR_SL
+        else:
+            rr_oran = ATR_TP / ATR_SL
+
+    # Kelly formülü
+    p = float(np.clip(win_rate, 0.1, 0.95))
+    q = 1.0 - p
+    b = float(max(rr_oran, 0.1))
+
+    kelly_f = (b * p - q) / b
+    kelly_f = float(np.clip(kelly_f, 0.0, KELLY_MAX_YOO))
+    yari_kelly = kelly_f / 2.0
+
+    if kelly_f <= 0:
+        aciklama = "Kelly negatif — pozisyon açma (beklenen değer < 0)"
+    elif yari_kelly < 0.05:
+        aciklama = f"Çok küçük pozisyon — portföyün %{yari_kelly*100:.1f}'i öneriliyor"
+    elif yari_kelly < 0.15:
+        aciklama = f"Orta pozisyon — portföyün %{yari_kelly*100:.1f}'i öneriliyor"
+    else:
+        aciklama = f"Güçlü pozisyon — portföyün %{yari_kelly*100:.1f}'i öneriliyor"
+
+    return {
+        "kelly_f":    round(kelly_f, 4),
+        "yari_kelly": round(yari_kelly, 4),
+        "yoo_pct":    round(yari_kelly * 100, 1),
+        "win_rate":   round(p, 4),
+        "rr_oran":    round(b, 2),
+        "aciklama":   aciklama,
+    }
+
+
+# ════════════════════════════════════════════════════════════════════════
+#  KATMAN v8-B: MONTE CARLO SİMÜLASYONU — Risk Analizi
+# ════════════════════════════════════════════════════════════════════════
+
+def monte_carlo_sim(df, n_senaryo=None, n_gun=252):
+    """
+    Geometric Brownian Motion ile Monte Carlo simülasyonu.
+    Son 1 yılın günlük getiri istatistiklerini kullanarak
+    gelecek 252 günlük N senaryo üretir.
+
+    Döndürür: {
+        "median_getiri": medyan nihai getiri %,
+        "pct10":  en kötü %10 senaryo getirisi,
+        "pct90":  en iyi %90 senaryo getirisi,
+        "max_dd": ortalama maksimum drawdown %,
+        "pozitif_oran": pozitif biten senaryo oranı,
+        "var_95": Value at Risk %95 güven (günlük),
+        "aciklama": metin özet,
+    }
+    """
+    if n_senaryo is None:
+        n_senaryo = MONTE_CARLO_SENARYO
+
+    c = df["Close"].squeeze()
+    # Son 252 günün günlük getirileri
+    gun_getiri = c.pct_change().dropna().tail(252).values
+    if len(gun_getiri) < 30:
+        return None
+
+    mu  = float(np.mean(gun_getiri))
+    sig = float(np.std(gun_getiri))
+
+    if sig <= 0:
+        return None
+
+    # GBM simülasyonu: S(t+1) = S(t) × exp((mu - 0.5σ²)dt + σ√dt × Z)
+    np.random.seed(42)
+    Z = np.random.standard_normal((n_senaryo, n_gun))
+    drift = mu - 0.5 * sig**2
+    daily = np.exp(drift + sig * Z)         # (n_senaryo, n_gun)
+    # Kümülatif getiri (başlangıç = 1.0)
+    equity = np.cumprod(daily, axis=1)       # (n_senaryo, n_gun)
+    final  = equity[:, -1]                   # nihai değerler
+
+    # Maksimum drawdown her senaryo için
+    def max_dd_hesapla(eq_curve):
+        peak = np.maximum.accumulate(eq_curve)
+        dd   = (eq_curve - peak) / (peak + 1e-9)
+        return float(np.min(dd) * 100)
+
+    # Örneklem (hız için 200 senaryo üzerinden DD hesapla)
+    dd_list = [max_dd_hesapla(equity[i]) for i in range(min(200, n_senaryo))]
+    ort_dd  = float(np.mean(dd_list))
+
+    # VaR %95 (günlük)
+    var_95 = float(np.percentile(gun_getiri, 5) * 100)
+
+    poz_oran = float(np.mean(final > 1.0) * 100)
+    med_get  = float((np.median(final) - 1.0) * 100)
+    p10      = float((np.percentile(final, 10) - 1.0) * 100)
+    p90      = float((np.percentile(final, 90) - 1.0) * 100)
+
+    if med_get > 10:
+        aciklama = f"Olumlu beklenti: medyan +{med_get:.1f}%, {poz_oran:.0f}% senaryo pozitif"
+    elif med_get > 0:
+        aciklama = f"Zayıf pozitif beklenti: medyan +{med_get:.1f}%, DD riski {abs(ort_dd):.1f}%"
+    else:
+        aciklama = f"Negatif beklenti: medyan {med_get:.1f}%, yüksek risk"
+
+    return {
+        "median_getiri": round(med_get, 2),
+        "pct10":         round(p10, 2),
+        "pct90":         round(p90, 2),
+        "max_dd":        round(abs(ort_dd), 2),
+        "pozitif_oran":  round(poz_oran, 1),
+        "var_95":        round(var_95, 3),
+        "aciklama":      aciklama,
+        "n_senaryo":     n_senaryo,
+    }
+
+
+# ════════════════════════════════════════════════════════════════════════
+#  KATMAN v8-C: WHALE / VOLUME SPIKE DEDEKTÖRÜ
+# ════════════════════════════════════════════════════════════════════════
+
+def whale_dedektoru(df):
+    """
+    Büyük lot (balina) girişini tespit et.
+
+    Algoritma:
+    1. Hacim Spike: Güncel hacim > N×(20-günlük ortalama hacim)
+    2. OBV Sapması: OBV ani yükseliş = alım yönlü balina
+    3. Fiyat-Hacim Uyumu: Fiyat artarken hacim patlaması = güçlü AL
+                          Fiyat düşerken hacim patlaması = güçlü SAT
+
+    Döndürür: {
+        "spike_var": bool,
+        "spike_katsayi": hacim / ortalama,
+        "yon": "AL" | "SAT" | "NOTR",
+        "guc": 1-3 (1=zayıf, 3=güçlü),
+        "puan": sinyal puanı katkısı,
+        "aciklama": metin,
+    }
+    """
+    c = df["Close"].squeeze()
+    v = df["Volume"].squeeze()
+    h = df["High"].squeeze()
+    l = df["Low"].squeeze()
+
+    if len(v) < WHALE_PENCERE + 5:
+        return {"spike_var": False, "puan": 0, "aciklama": "Veri yetersiz", "yon": "NOTR"}
+
+    v_ort   = float(v.rolling(WHALE_PENCERE).mean().iloc[-1])
+    v_son   = float(v.iloc[-1])
+    v_kat   = v_son / max(v_ort, 1)
+
+    # Son 3 günün hacim ortalaması vs önceki 17 gün
+    v_kisa  = float(v.iloc[-3:].mean())
+    v_uzun  = float(v.iloc[-WHALE_PENCERE:-3].mean())
+    v_trend = v_kisa / max(v_uzun, 1)
+
+    # OBV değişimi
+    obv_s  = Ind.obv(c, v)
+    obv_ch = float(obv_s.pct_change(3).iloc[-1]) if len(obv_s) > 3 else 0.0
+
+    # Fiyat yönü (son 2 gün)
+    c_ch = float(c.pct_change(2).iloc[-1])
+
+    spike_var = v_kat >= WHALE_CARPAN
+
+    if not spike_var and v_trend < 2.0:
+        return {"spike_var": False, "spike_katsayi": round(v_kat, 2),
+                "yon": "NOTR", "guc": 0, "puan": 0,
+                "aciklama": f"Normal hacim (×{v_kat:.1f})"}
+
+    # Yön belirleme
+    if c_ch > 0.005 and obv_ch > 0:
+        yon = "AL"; temel_puan = 2
+        aciklama = f"🐋 Balina GİRİŞİ — Hacim ×{v_kat:.1f}, fiyat yukarı"
+    elif c_ch < -0.005 and obv_ch < 0:
+        yon = "SAT"; temel_puan = -2
+        aciklama = f"🐋 Balina ÇIKIŞI — Hacim ×{v_kat:.1f}, fiyat aşağı"
+    elif c_ch > 0:
+        yon = "AL"; temel_puan = 1
+        aciklama = f"📊 Hacim patlaması ×{v_kat:.1f} (AL yönlü)"
+    else:
+        yon = "SAT"; temel_puan = -1
+        aciklama = f"📊 Hacim patlaması ×{v_kat:.1f} (SAT yönlü)"
+
+    # Güç seviyesi
+    guc = 3 if v_kat >= WHALE_CARPAN * 2 else (2 if v_kat >= WHALE_CARPAN else 1)
+    puan = temel_puan * (1 if guc == 1 else guc // 2 + 1)
+    puan = int(np.clip(puan, -3, 3))
+
+    return {
+        "spike_var":      spike_var,
+        "spike_katsayi":  round(v_kat, 2),
+        "yon":            yon,
+        "guc":            guc,
+        "puan":           puan,
+        "obv_ch":         round(obv_ch * 100, 2),
+        "aciklama":       aciklama,
+    }
+
+
+# ════════════════════════════════════════════════════════════════════════
+#  KATMAN v8-D: KORELASYON MATRİSİ & SEKTÖREL ROTASYON
+# ════════════════════════════════════════════════════════════════════════
+
+_korelasyon_cache = {}
+_kor_lock = __import__("threading").Lock()
+
+def korelasyon_analizi(sembol, df):
+    """
+    Hisseyi ilgili endeksle karşılaştır.
+    BIST hisseleri → BIST100 (xu100.is)
+    ABD hisseleri  → S&P500 (^spx)
+
+    Döndürür: {
+        "kor_60d": 60-günlük korelasyon katsayısı,
+        "ayrisma": "POZITIF" | "NEGATIF" | "NOTR",
+        "puan": sinyal katkısı,
+        "beta": beta katsayısı,
+        "rs_14d": göreceli güç (hisse / endeks, 14 gün),
+        "aciklama": metin,
+    }
+    """
+    bist = sembol.endswith(".IS")
+    endeks_sembol = "xu100.is" if bist else "^spx"
+    cache_key = f"{sembol}_{endeks_sembol}"
+
+    with _kor_lock:
+        if cache_key in _korelasyon_cache:
+            ts, veri = _korelasyon_cache[cache_key]
+            if time.time() - ts < 3600:
+                return veri
+
+    try:
+        # Makro cache'ten al (zaten indirilmiş olabilir)
+        mv = makro_veri_getir()
+        endeks_s = mv.get("BIST100" if bist else "SP500", pd.Series(dtype=float))
+
+        if len(endeks_s) < KORELASYON_PENCERE or len(df) < KORELASYON_PENCERE:
+            return {"kor_60d": 0.0, "ayrisma": "NOTR", "puan": 0,
+                    "beta": 1.0, "rs_14d": 1.0, "aciklama": "Endeks verisi yetersiz"}
+
+        # Hizala
+        hisse_ret  = df["Close"].squeeze().pct_change().dropna()
+        endeks_ret = endeks_s.pct_change().dropna()
+
+        aligned = pd.concat([hisse_ret, endeks_ret], axis=1, join="inner").dropna()
+        aligned.columns = ["hisse", "endeks"]
+
+        if len(aligned) < 20:
+            return {"kor_60d": 0.0, "ayrisma": "NOTR", "puan": 0,
+                    "beta": 1.0, "rs_14d": 1.0, "aciklama": "Hizalama başarısız"}
+
+        # Son 60 gün
+        son60 = aligned.tail(KORELASYON_PENCERE)
+        kor   = float(son60["hisse"].corr(son60["endeks"]))
+
+        # Beta = Cov(hisse, endeks) / Var(endeks)
+        cov   = float(son60["hisse"].cov(son60["endeks"]))
+        var_e = float(son60["endeks"].var())
+        beta  = cov / max(var_e, 1e-9)
+        beta  = float(np.clip(beta, -3.0, 3.0))
+
+        # Göreceli güç: son 14 günde hisse vs endeks toplam getirisi
+        son14 = aligned.tail(14)
+        rs_hisse  = float((1 + son14["hisse"]).prod() - 1)
+        rs_endeks = float((1 + son14["endeks"]).prod() - 1)
+        rs_14d    = rs_hisse - rs_endeks  # pozitif = hisse endeksten güçlü
+
+        # Ayrışma tespiti
+        # Son 5 günde endeks düştü ama hisse yükseldi (veya tersi)
+        son5 = aligned.tail(5)
+        endeks_5d = float((1 + son5["endeks"]).prod() - 1)
+        hisse_5d  = float((1 + son5["hisse"]).prod() - 1)
+
+        puan = 0
+        if endeks_5d < -0.01 and hisse_5d > 0.005:
+            ayrisma = "POZITIF"
+            puan = 2
+            aciklama = f"💪 Pozitif Ayrışma: Endeks ↓{abs(endeks_5d)*100:.1f}%, Hisse ↑{hisse_5d*100:.1f}%"
+        elif endeks_5d > 0.01 and hisse_5d < -0.005:
+            ayrisma = "NEGATIF"
+            puan = -2
+            aciklama = f"⚠️ Negatif Ayrışma: Endeks ↑{endeks_5d*100:.1f}%, Hisse ↓{abs(hisse_5d)*100:.1f}%"
+        elif rs_14d > 0.02:
+            ayrisma = "POZITIF"
+            puan = 1
+            aciklama = f"📈 Göreceli güç: Endeksin +{rs_14d*100:.1f}% üzerinde (14g)"
+        elif rs_14d < -0.02:
+            ayrisma = "NEGATIF"
+            puan = -1
+            aciklama = f"📉 Görece zayıf: Endeksin {rs_14d*100:.1f}% altında (14g)"
+        else:
+            ayrisma = "NOTR"
+            puan = 0
+            aciklama = f"Endeks ile uyumlu (β:{beta:.2f}, kor:{kor:.2f})"
+
+        sonuc = {
+            "kor_60d":   round(kor, 3),
+            "ayrisma":   ayrisma,
+            "puan":      puan,
+            "beta":      round(beta, 2),
+            "rs_14d":    round(rs_14d * 100, 2),
+            "endeks_5d": round(endeks_5d * 100, 2),
+            "hisse_5d":  round(hisse_5d * 100, 2),
+            "aciklama":  aciklama,
+        }
+
+        with _kor_lock:
+            _korelasyon_cache[cache_key] = (time.time(), sonuc)
+        return sonuc
+
+    except Exception as e:
+        return {"kor_60d": 0.0, "ayrisma": "NOTR", "puan": 0,
+                "beta": 1.0, "rs_14d": 0.0, "aciklama": f"Hata: {str(e)[:40]}"}
+
+
+# ════════════════════════════════════════════════════════════════════════
+#  KATMAN v8-E: DİNAMİK TRAILING STOP
+# ════════════════════════════════════════════════════════════════════════
+
+def trailing_stop_hesapla(df):
+    """
+    ATR tabanlı dinamik trailing stop.
+
+    Algoritma:
+    - Trailing Stop = Güncel fiyat - TRAILING_ATR_CARPAN × ATR(14)
+    - Her yeni yüksek yapıldığında stop yukarı taşınır (hiçbir zaman aşağı inmez)
+    - Son N günlük trailing stop seviyesini hesaplar
+
+    Döndürür: {
+        "trailing_sl": güncel trailing stop fiyatı,
+        "mesafe_pct": fiyat ile trailing stop arasındaki % mesafe,
+        "uzun_trailimg_sl": son 20 günlük en yüksek trailing stop,
+        "trend_guclu": bool (trailing stop sürekli yükseliyor mu),
+        "aciklama": metin,
+    }
+    """
+    c = df["Close"].squeeze()
+    h = df["High"].squeeze()
+    l = df["Low"].squeeze()
+
+    if len(c) < 30:
+        fiyat = float(c.iloc[-1]); at = float(Ind.atr(h, l, c).iloc[-1])
+        return {
+            "trailing_sl": round(fiyat - TRAILING_ATR_CARPAN * at, 4),
+            "mesafe_pct": round(TRAILING_ATR_CARPAN * at / fiyat * 100, 2),
+            "trend_guclu": False, "aciklama": "Veri kısa"
+        }
+
+    atr_s = Ind.atr(h, l, c)
+
+    # Son 50 günlük trailing stop hesapla
+    n = min(50, len(c))
+    trailing_stops = []
+    maks_fiyat = float(h.iloc[-n])
+
+    for i in range(-n, 0):
+        maks_fiyat = max(maks_fiyat, float(h.iloc[i]))
+        at = float(atr_s.iloc[i])
+        ts = maks_fiyat - TRAILING_ATR_CARPAN * at
+        trailing_stops.append(ts)
+
+    son_ts       = trailing_stops[-1]
+    maks_ts_20d  = max(trailing_stops[-20:]) if len(trailing_stops) >= 20 else son_ts
+    fiyat        = float(c.iloc[-1])
+    mesafe_pct   = (fiyat - son_ts) / fiyat * 100
+
+    # Trailing stop yukarı trend mi?
+    ts_son5  = trailing_stops[-5:]
+    trend_guclu = all(ts_son5[i] >= ts_son5[i-1] for i in range(1, len(ts_son5)))
+
+    if mesafe_pct < 2.0:
+        aciklama = f"⚠️ Trailing SL yakın ({mesafe_pct:.1f}% uzaklıkta) — {son_ts:.2f}"
+    elif trend_guclu:
+        aciklama = f"✅ Trailing SL yükseliyor — {son_ts:.2f} ({mesafe_pct:.1f}% uzak)"
+    else:
+        aciklama = f"Trailing SL: {son_ts:.2f} ({mesafe_pct:.1f}% uzak)"
+
+    return {
+        "trailing_sl":     round(son_ts, 4),
+        "mesafe_pct":      round(mesafe_pct, 2),
+        "uzun_trailing_sl":round(maks_ts_20d, 4),
+        "trend_guclu":     trend_guclu,
+        "aciklama":        aciklama,
+    }
+
+
+# ════════════════════════════════════════════════════════════════════════
+#  KATMAN v8-F: FİNAL CONFIDENCE SCORE (Pipeline)
+# ════════════════════════════════════════════════════════════════════════
+
+def final_confidence_score(kural_puan, ml, whale, korelasyon, mc, kelly):
+    """
+    Tüm modüllerden gelen puanları ağırlıklı olarak birleştir.
+    Nihai Güven Skoru = 0-100 arası normalize değer.
+
+    Ağırlıklar (araştırma bazlı):
+      - Teknik/Kural puan    : %35
+      - ML tahmin             : %25
+      - Whale/Hacim           : %15
+      - Korelasyon/Ayrışma    : %15
+      - Monte Carlo beklentisi: %10
+    """
+    # Teknik normalize (-15 ile +15 arası puana karşılık 0-100)
+    teknik_norm  = (kural_puan + 15) / 30.0 * 100
+
+    # ML normalize (güven × yön)
+    ml_norm = 50.0
+    if ml:
+        t = ml.get("tahmin", 0); g = ml.get("guven", 0.5)
+        ml_norm = 50 + t * g * 50
+
+    # Whale normalize (-3 ile +3 → 0-100)
+    whale_puan = whale.get("puan", 0) if whale else 0
+    whale_norm = (whale_puan + 3) / 6.0 * 100
+
+    # Korelasyon normalize (-2 ile +2 → 0-100)
+    kor_puan = korelasyon.get("puan", 0) if korelasyon else 0
+    kor_norm = (kor_puan + 2) / 4.0 * 100
+
+    # Monte Carlo normalize: pozitif_oran direkt 0-100
+    mc_norm = mc.get("pozitif_oran", 50.0) if mc else 50.0
+
+    # Ağırlıklı ortalama
+    score = (
+        teknik_norm  * 0.35 +
+        ml_norm      * 0.25 +
+        whale_norm   * 0.15 +
+        kor_norm     * 0.15 +
+        mc_norm      * 0.10
+    )
+    score = float(np.clip(score, 0, 100))
+
+    # Risk ayarı: Monte Carlo max_dd yüksekse skoru düşür
+    if mc and mc.get("max_dd", 0) > 20:
+        score *= 0.85  # %20+ drawdown riski varsa %15 penaltı
+
+    # Etiket
+    if score >= 70:   etiket = "YÜKSEK GÜVEN 🟢"
+    elif score >= 55: etiket = "ORTA GÜVEN 🟡"
+    elif score >= 40: etiket = "DÜŞÜK GÜVEN 🟠"
+    else:             etiket = "RİSKLİ 🔴"
+
+    return {
+        "skor":    round(score, 1),
+        "etiket":  etiket,
+        "dagılım": {
+            "teknik":      round(teknik_norm, 1),
+            "ml":          round(ml_norm, 1),
+            "whale":       round(whale_norm, 1),
+            "korelasyon":  round(kor_norm, 1),
+            "monte_carlo": round(mc_norm, 1),
+        }
+    }
+
 def karar_birlestir(kural, ml):
     ml_puan=0; ml_str="—"; guven=0.0
     if ml:
@@ -1362,6 +1853,8 @@ def analiz(sembol, yeniden=False):
     try:
         df=veri_getir(sembol)
         if df.empty or len(df)<200: return None
+
+        # ── Temel analiz ──────────────────────────────────────────────
         kural=kural_sinyal(df,sembol=sembol)
         ts=time.time()
         with _model_lock: cache_var=_model.get(sembol)
@@ -1371,7 +1864,72 @@ def analiz(sembol, yeniden=False):
         else:
             ml=cache_var[1]
         sonuc=karar_birlestir(kural,ml)
-        sonuc["anlik"]=bigpara_anlik(sembol) if sembol in BIST_SEMBOLLER else None
+
+        # ── v8 Pipeline Modülleri (arka planda, hız öncelikli) ────────
+        whale   = whale_dedektoru(df)    if WHALE_AKTIF        else {}
+        kor     = korelasyon_analizi(sembol, df) if KORELASYON_AKTIF else {}
+        trail   = trailing_stop_hesapla(df) if TRAILING_STOP_AKTIF else {}
+        mc      = None
+        kelly   = None
+
+        if MONTE_CARLO_AKTIF:
+            try:
+                mc = monte_carlo_sim(df, n_senaryo=500)  # 500 = hız/doğruluk dengesi
+            except Exception:
+                mc = None
+
+        if KELLY_AKTIF:
+            try:
+                # Backtest sonucu varsa kullan (ML cache'ten)
+                bt_sonuc = None
+                kelly = kelly_criterion(ml, bt_sonuc)
+            except Exception:
+                kelly = None
+
+        # ── Final Confidence Score ────────────────────────────────────
+        fcs = final_confidence_score(
+            kural.get("puan", 0), ml, whale, kor, mc, kelly)
+
+        # ── Whale puanını ana skor'a ekle ─────────────────────────────
+        if whale and WHALE_AKTIF:
+            sonuc["toplam"] = sonuc.get("toplam", 0) + whale.get("puan", 0)
+            sonuc["skor"]   = sonuc["toplam"]
+            if whale.get("puan", 0) != 0:
+                sonuc.setdefault("notlar", []).append(whale.get("aciklama", ""))
+
+        # ── Korelasyon puanını ana skor'a ekle ───────────────────────
+        if kor and KORELASYON_AKTIF and kor.get("puan", 0) != 0:
+            sonuc["toplam"] = sonuc.get("toplam", 0) + kor.get("puan", 0)
+            sonuc["skor"]   = sonuc["toplam"]
+            sonuc.setdefault("notlar", []).append(kor.get("aciklama", ""))
+
+        # ── Karar yeniden hesapla (puan değişti) ─────────────────────
+        toplam = sonuc["toplam"]
+        if   toplam >= GUCLU_ESIK:  sonuc["karar"] = "🟢 GÜÇLÜ AL"
+        elif toplam >= 4:            sonuc["karar"] = "🟡 AL"
+        elif toplam <=-GUCLU_ESIK:  sonuc["karar"] = "🔴 GÜÇLÜ SAT"
+        elif toplam <=-4:            sonuc["karar"] = "🟠 SAT"
+        else:                        sonuc["karar"] = "⚪ BEKLE"
+
+        # ── Sonuca v8 alanlarını ekle ────────────────────────────────
+        sonuc["whale"]   = whale
+        sonuc["kor"]     = kor
+        sonuc["trail"]   = trail
+        sonuc["mc"]      = mc
+        sonuc["kelly"]   = kelly
+        sonuc["fcs"]     = fcs
+        sonuc["anlik"]   = bigpara_anlik(sembol) if sembol in BIST_SEMBOLLER else None
+
+        # Trailing stop override (statik SL'den daha akıllı)
+        if trail and TRAILING_STOP_AKTIF:
+            ts_val = trail.get("trailing_sl")
+            if ts_val and ts_val > sonuc.get("sl", 0):
+                sonuc["sl_trailing"] = ts_val
+            else:
+                sonuc["sl_trailing"] = sonuc.get("sl", 0)
+        else:
+            sonuc["sl_trailing"] = sonuc.get("sl", 0)
+
         return sonuc
     except Exception as e:
         return {"hata":str(e)[:70]}
@@ -1386,7 +1944,7 @@ def baslik(dongu):
     print(Fore.CYAN+Style.BRIGHT+"""
 ╔══════════════════════════════════════════════════════════════════════════╗
 ║   🏦  TRADE SİNYAL SİSTEMİ  ULTRA  v7.0  —  Termux Edition            ║
-║   RF+HistGB Ensemble | 60+ Özellik | Makro+Sentiment+Diverjans         ║
+║   RF+HistGB+Kelly+MC | Whale | Korelasyon | Trailing Stop | FCS        ║
 ╚══════════════════════════════════════════════════════════════════════════╝""")
     print(Fore.WHITE+f"   🕐 {datetime.now().strftime('%d.%m.%Y %H:%M')}  "
           f"│  🔄 #{dongu}  │  🧠 {len(_model)} model  │  📦 {len(_veri)} sembol")
@@ -1496,7 +2054,47 @@ def detay_panel(sembol, s):
               f"│  Eğitim:{ml['n']} gün  │  Güven:{ml['guven']*100:.1f}%")
         proba=ml["proba"]; pb=lambda k: f"{proba.get(k,0)*100:.0f}%"
         print(f"  {Fore.CYAN}  Olası : AL {Fore.GREEN}{pb(1)}{Fore.CYAN}  BEKLE {pb(0)}  SAT {Fore.RED}{pb(-1)}")
-    for n in s["notlar"][:10]:
+    # ── v8: Whale ──────────────────────────────────────────────────────
+    whale = s.get("whale", {})
+    if whale and whale.get("spike_var"):
+        wc = Fore.GREEN if whale.get("yon") == "AL" else Fore.RED
+        print(f"  {wc}  WHALE  : {whale.get('aciklama','')}  Güç:{whale.get('guc',0)}/3{Style.RESET_ALL}")
+
+    # ── v8: Korelasyon ─────────────────────────────────────────────────
+    kor = s.get("kor", {})
+    if kor:
+        kc = Fore.GREEN if kor.get("ayrisma") == "POZITIF" else Fore.RED if kor.get("ayrisma") == "NEGATIF" else Fore.WHITE
+        print(f"  {kc}  KOR    : {kor.get('aciklama','')}  β:{kor.get('beta',1):.2f}{Style.RESET_ALL}")
+
+    # ── v8: Trailing Stop ──────────────────────────────────────────────
+    trail = s.get("trail", {})
+    if trail:
+        tc = Fore.YELLOW if trail.get("mesafe_pct",5) < 2 else Fore.GREEN
+        ts_val = trail.get("trailing_sl", 0)
+        print(f"  {tc}  TRAIL  : {trail.get('aciklama','')}  SL={ts_val:.2f}{Style.RESET_ALL}")
+
+    # ── v8: Monte Carlo ────────────────────────────────────────────────
+    mc = s.get("mc", {})
+    if mc:
+        mc_c = Fore.GREEN if mc.get("median_getiri",0) > 0 else Fore.RED
+        print(f"  {mc_c}  MC     : {mc.get('aciklama','')}  "
+              f"DD:{mc.get('max_dd',0):.1f}%  VaR:{mc.get('var_95',0):.2f}%{Style.RESET_ALL}")
+
+    # ── v8: Kelly ──────────────────────────────────────────────────────
+    kelly = s.get("kelly", {})
+    if kelly:
+        kc2 = Fore.GREEN if kelly.get("yoo_pct",0) > 10 else Fore.YELLOW
+        print(f"  {kc2}  KELLY  : {kelly.get('aciklama','')}  "
+              f"WR:{kelly.get('win_rate',0)*100:.1f}%  R/R:{kelly.get('rr_oran',2):.1f}{Style.RESET_ALL}")
+
+    # ── v8: Final Confidence Score ─────────────────────────────────────
+    fcs = s.get("fcs", {})
+    if fcs:
+        fs = fcs.get("skor", 50); fe = fcs.get("etiket", "")
+        fc = Fore.GREEN if fs >= 70 else Fore.YELLOW if fs >= 55 else Fore.RED
+        print(f"  {fc}  FCS    : {fe}  Skor: {fs:.1f}/100{Style.RESET_ALL}")
+
+    for n in s["notlar"][:8]:
         print(f"  {Fore.WHITE}  • {n}")
     print(f"  {Fore.CYAN}{'━'*68}")
 
